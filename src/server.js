@@ -2,7 +2,7 @@ const express = require('express');
 const OpenAI = require('openai');
 
 const app = express();
-app.use(express.json({ limit: '100kb' }));
+app.use(express.json({ limit: '300kb' }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const MODEL = process.env.SBA_MODEL || 'gpt-4o-mini';
@@ -100,6 +100,77 @@ app.post('/chat', async (req, res) => {
       answer: "Sorry, something went wrong on our end. We've noted this.",
       escalate: true,
     });
+  }
+});
+
+function buildExtractPrompt(pages, existingServiceNames) {
+  const pageText = pages
+    .map((p) => `--- PAGE: ${p.title || '(untitled)'} ---\n${p.content}`)
+    .join('\n\n')
+    .slice(0, 40000);
+
+  const existing = existingServiceNames.length
+    ? `Already listed, don't repeat: ${existingServiceNames.join(', ')}.`
+    : '';
+
+  return [
+    'You are helping a local service business set up their website chatbot by reading their own existing site content and pulling out structured facts.',
+    'Below is text scraped from their own published pages. Extract ONLY what is actually stated — never invent prices, hours, or services that aren\'t mentioned.',
+    existing,
+    '',
+    'Return ONLY a JSON object of this exact shape:',
+    '{',
+    '  "business_name": string or null,',
+    '  "hours_guess": string or null (e.g. "09:00-17:00", only if explicitly stated),',
+    '  "service_area_guess": string[] (postcodes/towns/areas explicitly mentioned, empty array if none),',
+    '  "services": [',
+    '    { "name": string, "description": string (1-2 plain sentences), "price_min": number or null, "price_max": number or null, "fixed_price": boolean, "duration_mins": number or null }',
+    '  ]',
+    '}',
+    '',
+    'Only include a service if the site clearly describes it as something the business offers. If no price is mentioned anywhere for a service, leave price_min/price_max null rather than guessing.',
+    '',
+    pageText,
+  ].join('\n');
+}
+
+app.post('/extract-business-info', async (req, res) => {
+  try {
+    const { site_key, pages, existing_service_names } = req.body || {};
+
+    if (!site_key || !Array.isArray(pages) || !pages.length) {
+      return res.status(400).json({ error: 'Bad request.' });
+    }
+    if (!withinLimit(site_key + ':scan')) {
+      return res.status(429).json({ error: 'Scan already run recently — please wait a bit before trying again.' });
+    }
+
+    const prompt = buildExtractPrompt(pages, existing_service_names || []);
+
+    const completion = await openai.chat.completions.create({
+      model: MODEL,
+      max_tokens: 2000,
+      response_format: { type: 'json_object' },
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const raw = completion.choices?.[0]?.message?.content || '{}';
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (e) {
+      return res.status(200).json({ business_name: null, hours_guess: null, service_area_guess: [], services: [] });
+    }
+
+    return res.status(200).json({
+      business_name: parsed.business_name || null,
+      hours_guess: parsed.hours_guess || null,
+      service_area_guess: Array.isArray(parsed.service_area_guess) ? parsed.service_area_guess : [],
+      services: Array.isArray(parsed.services) ? parsed.services : [],
+    });
+  } catch (err) {
+    console.error('extract error', err);
+    return res.status(500).json({ error: 'Scan failed, please try again.' });
   }
 });
 
