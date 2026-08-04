@@ -1,11 +1,11 @@
 const express = require('express');
-const Anthropic = require('@anthropic-ai/sdk');
+const OpenAI = require('openai');
 
 const app = express();
 app.use(express.json({ limit: '100kb' }));
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const MODEL = process.env.SBA_MODEL || 'claude-haiku-4-5';
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const MODEL = process.env.SBA_MODEL || 'gpt-4o-mini';
 
 // In-memory per-site daily counters. Resets on restart/redeploy — fine for
 // single-instance MVP; move to a shared store (Redis) before scaling to
@@ -72,18 +72,20 @@ app.post('/chat', async (req, res) => {
 
     const system = buildSystemPrompt(context || {});
 
-    const completion = await anthropic.messages.create({
+    const completion = await openai.chat.completions.create({
       model: MODEL,
       max_tokens: 300,
-      system,
-      messages: [{ role: 'user', content: message }],
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: message },
+      ],
     });
 
-    const raw = completion.content?.[0]?.text || '';
+    const raw = completion.choices?.[0]?.message?.content || '';
     let parsed;
     try {
-      const jsonMatch = raw.match(/\{[\s\S]*\}/);
-      parsed = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+      parsed = JSON.parse(raw);
     } catch (e) {
       parsed = { answer: raw || "I'm not sure — I'll pass this on to the team.", escalate: true };
     }
