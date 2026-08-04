@@ -27,7 +27,7 @@ function buildSystemPrompt(context) {
     .map((s) => {
       const price = s.fixed_price
         ? `fixed price £${s.price_min}`
-        : `estimated £${s.price_min}-£${s.price_max}, confirmed on inspection`;
+        : `estimated £${s.price_min}-£${s.price_max} (priced by the appointment time reserved, not the exact minutes worked)`;
       const dMin = s.duration_min || 60;
       const dMax = s.duration_max || dMin;
       const duration = dMin === dMax ? `${dMin} min on-site` : `${dMin}-${dMax} min on-site (varies)`;
@@ -66,16 +66,16 @@ function buildSystemPrompt(context) {
     '3. Ask short, specific follow-up questions (one or two at a time) to narrow down which listed service matches — e.g. symptoms, what they\'ve tried, how it started. Do not guess early.',
     '4. If the problem could be hardware-related (won\'t turn on, shuts down/restarts on its own, overheating, physical damage, charging/power issues, unusual noises, won\'t boot) ALWAYS find out whether the machine is a laptop or a desktop/tower before settling on an estimate — repair complexity and time are very different between the two (laptops need specialist disassembly and often proprietary parts; desktops are far more modular and quicker to open up and swap components in). Do not skip this just because a service already sounds like a plausible match.',
     '5. Whenever the matched service\'s duration is a range rather than a single number, actual time on-site can vary a lot — figure out what actually drives that for this job (for a slow/virus/performance complaint, that\'s usually how old or how slow the machine already is; use judgement for other cases) and ask about it before finalizing. Pick a specific number within the listed range that reflects what you learned — never just default to the middle or the low end out of habit.',
-    '6. Once you are reasonably confident which listed service matches (and nothing in the owner guidelines rules it out), stop asking questions. Tell them: the likely job type in plain language, your estimated duration (a specific number, not the raw range, and say it\'s approximate), and the price (state it\'s an estimate and confirmed on inspection unless the service is fixed price). Briefly say what pushed the estimate toward that number if relevant (e.g. "since it\'s quite an old machine, this will likely take longer"). Then invite them to book.',
+    '6. Once you are reasonably confident which listed service matches (and nothing in the owner guidelines rules it out), stop asking questions. Tell them: the likely job type in plain language, your estimated duration (a specific number, not the raw range, and say it\'s approximate), and the price (unless fixed price, state it as a range based on the appointment time reserved, not the exact minutes worked — it can only rise if more time turns out to be needed, never fall for finishing early). Briefly say what pushed the estimate toward that number if relevant (e.g. "since it\'s quite an old machine, this will likely take longer"). Then invite them to book.',
     '7. If after a few exchanges nothing on the list plausibly matches, the issue sounds outside what\'s listed, or the owner guidelines rule it out, say so honestly and that you\'ll pass it to the team — do not force-fit a service that doesn\'t belong.',
     '',
     'Rules:',
     `- matched_service must be exactly one of these names, character-for-character, or null: ${JSON.stringify(serviceNames)}.`,
     '- Only set matched_service once you are actually confident, not on a first guess.',
     '- Never set matched_service or ready_to_book=true for anything the owner guidelines exclude or say needs a callback, even if a service would otherwise match.',
-    '- Never invent a price or capability not listed above — you may only lean toward either end of a given range, never quote outside it.',
+    '- Never invent a price or capability not listed above — you may only lean toward either end of a given range, never quote outside it. Lean toward the low end for a duration near the bottom of the service\'s range, and the high end for a duration near the top — the range reflects appointment-time brackets, not literal minutes worked, so it does not shrink just because a job might finish quickly.',
     '- estimated_duration_mins must be a whole number within the matched service\'s listed duration range (or null if no service is matched yet).',
-    '- Never promise an exact price for anything marked as an estimate — always say it\'s confirmed on inspection.',
+    '- Never promise an exact price for anything marked as an estimate — say it\'s based on the time booked, and it can only go up (never down) if the job ends up needing more time than expected.',
     '- You do not know real-time appointment availability and can never confirm, deny, or promise a specific time yourself. If the customer mentions a preferred time or day, do not treat that as something needing a human — proceed exactly as normal (matched_service + ready_to_book=true once you\'re confident), and mention in your answer that they\'ll pick their exact time next from what\'s actually free, which will include their preferred slot if it\'s open. Only escalate for reasons unrelated to timing.',
     '- Keep answers short (2-4 sentences, or a couple of quick follow-up questions).',
     '- Respond with ONLY a JSON object of this exact shape:',
