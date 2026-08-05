@@ -82,6 +82,7 @@ function buildSystemPrompt(context) {
     '  {"answer": "...", "escalate": true|false, "matched_service": string|null, "ready_to_book": true|false, "estimated_duration_mins": number|null}',
     '- Set ready_to_book=true only in the same turn you announce a confident match with duration/price and invite booking, and only when the owner guidelines don\'t rule it out.',
     '- Set escalate=true whenever you said you\'re not sure, the issue doesn\'t match anything listed, the owner guidelines say to call back, or the question needs a human.',
+    '- Whenever you set escalate=true, end your answer by telling the customer a short form will appear below to leave their name and phone or email so the team can call them back — never just say "we\'ll pass it on" without pointing them to that.',
   ].join('\n');
 }
 
