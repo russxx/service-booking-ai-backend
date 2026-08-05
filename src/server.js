@@ -139,21 +139,30 @@ app.post('/chat', async (req, res) => {
     const allServices = context && context.services ? context.services : [];
     const serviceNames = allServices.map((s) => s.name);
     const matched = parsed.matched_service && serviceNames.includes(parsed.matched_service) ? parsed.matched_service : null;
+    const matchedSvc = matched ? allServices.find((s) => s.name === matched) : null;
 
     // Never trust the model's duration figure blindly — clamp it to the
     // matched service's own configured range, same as every other number
     // in this response.
     let estimatedDuration = null;
-    if (matched) {
-      const svc = allServices.find((s) => s.name === matched);
-      const dMin = (svc && svc.duration_min) || 60;
-      const dMax = (svc && svc.duration_max) || dMin;
+    if (matchedSvc) {
+      const dMin = matchedSvc.duration_min || 60;
+      const dMax = matchedSvc.duration_max || dMin;
       const raw = parseInt(parsed.estimated_duration_mins, 10);
       estimatedDuration = Number.isFinite(raw) ? Math.min(Math.max(raw, dMin), dMax) : dMax;
     }
 
+    let answer = parsed.answer || "I'm not sure — I'll pass this on to the team.";
+    // The model doesn't reliably remember to mention this every time it
+    // quotes a price — enforced here instead of trusting free-text
+    // compliance, same reasoning as why escalation contact-capture is a
+    // real form rather than something we just told the model to ask for.
+    if (matchedSvc && matchedSvc.parts_may_apply && parsed.ready_to_book && !/parts/i.test(answer)) {
+      answer = answer.trim() + ' Parts, if this job needs any, are charged separately.';
+    }
+
     return res.status(200).json({
-      answer: parsed.answer || "I'm not sure — I'll pass this on to the team.",
+      answer,
       escalate: !!parsed.escalate,
       matched_service: matched,
       ready_to_book: !!parsed.ready_to_book && !!matched,
