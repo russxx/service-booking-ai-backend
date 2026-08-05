@@ -153,6 +153,22 @@ app.post('/chat', async (req, res) => {
     }
 
     let answer = parsed.answer || "I'm not sure — I'll pass this on to the team.";
+
+    // Rare, but the model has occasionally named a different service in its
+    // own prose than the one it actually matched (e.g. saying "Laptop
+    // Hardware Repair" while matched_service is "Desktop/Tower Hardware
+    // Repair"). The booking itself is unaffected either way — it's driven by
+    // matched_service, not the sentence — but a customer reading the
+    // contradiction is confusing, so straighten out any other known service
+    // name mentioned in the text to match what was actually matched.
+    if (matched) {
+      serviceNames.forEach((name) => {
+        if (name !== matched && answer.includes(name)) {
+          answer = answer.split(name).join(matched);
+        }
+      });
+    }
+
     // The model doesn't reliably remember to mention this every time it
     // quotes a price — enforced here instead of trusting free-text
     // compliance, same reasoning as why escalation contact-capture is a
