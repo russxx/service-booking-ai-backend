@@ -31,7 +31,8 @@ function buildSystemPrompt(context) {
       const dMin = s.duration_min || 60;
       const dMax = s.duration_max || dMin;
       const duration = dMin === dMax ? `${dMin} min on-site` : `${dMin}-${dMax} min on-site (varies)`;
-      return `- ${s.name} (${price}, ${duration}): ${s.description}`;
+      const parts = s.parts_may_apply ? ' Parts, if this job needs any, are charged separately.' : ' This job never needs parts — the price is the full cost.';
+      return `- ${s.name} (${price}, ${duration}): ${s.description}${parts}`;
     })
     .join('\n');
 
@@ -76,7 +77,7 @@ function buildSystemPrompt(context) {
     '- Never invent a price or capability not listed above — you may only lean toward either end of a given range, never quote outside it. Lean toward the low end for a duration near the bottom of the service\'s range, and the high end for a duration near the top — the range reflects appointment-time brackets, not literal minutes worked, so it does not shrink just because a job might finish quickly.',
     '- estimated_duration_mins must be a whole number within the matched service\'s listed duration range (or null if no service is matched yet).',
     '- Never promise an exact price for anything marked as an estimate — say it\'s based on the time booked, and it can only go up (never down) if the job ends up needing more time than expected.',
-    '- Every time you state a price, fixed or estimated, add "(parts excluded)" — labour only, any parts the job turns out to need are always quoted separately, never folded into the price shown.',
+    '- Every time you state a price for a service marked above as needing parts charged separately, add "(parts excluded)". Never add it for a service marked as never needing parts (e.g. a pure software/account/device setup) — don\'t mention parts at all for those, it would just be confusing.',
     '- You do not know real-time appointment availability and can never confirm, deny, or promise a specific time yourself. If the customer mentions a preferred time or day, do not treat that as something needing a human — proceed exactly as normal (matched_service + ready_to_book=true once you\'re confident), and mention in your answer that they\'ll pick their exact time next from what\'s actually free, which will include their preferred slot if it\'s open. Only escalate for reasons unrelated to timing.',
     '- Keep answers short (2-4 sentences, or a couple of quick follow-up questions).',
     '- Respond with ONLY a JSON object of this exact shape:',
