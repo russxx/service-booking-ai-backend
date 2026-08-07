@@ -358,6 +358,30 @@ app.post('/usage/reset', (req, res) => {
   return res.status(200).json({ ok: true });
 });
 
+// Plain-link version of /license/checkout — lets the static landing page use
+// a normal <a href> "Buy now" button with no JavaScript, since a form POST
+// isn't worth the markup for a single link.
+app.get('/buy', async (req, res) => {
+  const stripe = getStripe();
+  if (!stripe || !process.env.STRIPE_PRICE_SBA) {
+    return res.status(503).send('Checkout is not available right now — try again shortly or contact support@bluebootapps.com.');
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{ price: process.env.STRIPE_PRICE_SBA, quantity: 1 }],
+      allow_promotion_codes: true,
+      success_url: `${process.env.APP_URL}/license/thank-you?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.SITE_URL || process.env.APP_URL}/?canceled=1`,
+    });
+    return res.redirect(303, session.url);
+  } catch (err) {
+    console.error('buy redirect error', err);
+    return res.status(502).send('Checkout is not available right now — try again shortly or contact support@bluebootapps.com.');
+  }
+});
+
 app.post('/license/checkout', async (req, res) => {
   const stripe = getStripe();
   if (!stripe || !process.env.STRIPE_PRICE_SBA) {
