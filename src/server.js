@@ -1,8 +1,73 @@
 const express = require('express');
 const OpenAI = require('openai');
+const Stripe = require('stripe');
 const usageTracker = require('./usage');
+const licenses = require('./licenses');
 
 const app = express();
+
+function getStripe() {
+  if (!process.env.STRIPE_SECRET_KEY) return null;
+  return new Stripe(process.env.STRIPE_SECRET_KEY);
+}
+
+// Stripe webhook signature verification needs the exact raw request body, so
+// this route (and its own raw-body parser) must be registered before the
+// general express.json() below ever gets a chance to consume it.
+app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  const stripe = getStripe();
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+    return res.status(503).json({ error: 'not_configured' });
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('webhook signature verification failed', err.message);
+    return res.status(400).json({ error: 'invalid_signature' });
+  }
+
+  (async () => {
+    try {
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        // Retried deliveries must be a no-op — a license is a one-time,
+        // naturally idempotent grant, unlike the additive credit top-ups
+        // Magpie's webhook has to guard against, so a simple "does a
+        // license for this session already exist" check is enough here.
+        if (!licenses.getLicenseBySession(session.id)) {
+          const key = licenses.createLicense({
+            email: session.customer_details?.email || session.customer_email || null,
+            stripeCustomerId: typeof session.customer === 'string' ? session.customer : session.customer?.id || null,
+            stripeSessionId: session.id,
+          });
+          console.log('license created', key, 'for session', session.id);
+        }
+      } else if (event.type === 'charge.refunded' || event.type === 'charge.dispute.created') {
+        // A refund/dispute arrives keyed by charge, not checkout session, so
+        // look the session back up via its payment intent before we can
+        // find which license it minted.
+        const charge = event.data.object;
+        const paymentIntentId = typeof charge.payment_intent === 'string' ? charge.payment_intent : charge.payment_intent?.id;
+        if (paymentIntentId) {
+          const sessions = await stripe.checkout.sessions.list({ payment_intent: paymentIntentId, limit: 1 });
+          const session = sessions.data[0];
+          const key = session ? licenses.getLicenseKeyBySession(session.id) : null;
+          if (key) {
+            licenses.revokeLicense(key);
+            console.log('license revoked', key, 'due to', event.type);
+          }
+        }
+      }
+    } catch (err) {
+      console.error('webhook handling error', err);
+    }
+  })();
+
+  return res.status(200).json({ received: true });
+});
+
 app.use(express.json({ limit: '300kb' }));
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -291,6 +356,101 @@ app.post('/usage/reset', (req, res) => {
   }
   usageTracker.reset();
   return res.status(200).json({ ok: true });
+});
+
+app.post('/license/checkout', async (req, res) => {
+  const stripe = getStripe();
+  if (!stripe || !process.env.STRIPE_PRICE_SBA) {
+    return res.status(503).json({ error: 'not_configured' });
+  }
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      line_items: [{ price: process.env.STRIPE_PRICE_SBA, quantity: 1 }],
+      allow_promotion_codes: true,
+      success_url: `${process.env.APP_URL}/license/thank-you?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.SITE_URL || process.env.APP_URL}/?canceled=1`,
+    });
+    return res.status(200).json({ url: session.url });
+  } catch (err) {
+    console.error('checkout error', err);
+    return res.status(502).json({ error: 'checkout_unavailable' });
+  }
+});
+
+// Simple confirmation page after a successful purchase — looks the license
+// up by the Stripe session id Checkout redirected back with, so the buyer
+// sees their key immediately instead of only via email.
+app.get('/license/thank-you', async (req, res) => {
+  const stripe = getStripe();
+  const sessionId = req.query.session_id;
+  res.set('Content-Type', 'text/html; charset=utf-8');
+
+  if (!stripe || !sessionId) {
+    return res.status(400).send('<p>Missing session.</p>');
+  }
+
+  let key = licenses.getLicenseKeyBySession(sessionId);
+  let paid = !!key;
+
+  // The webhook usually wins the race, but if this page loads first, confirm
+  // the payment directly with Stripe and mint the license here instead of
+  // making the buyer wait on a redelivery. This lookup is also what stops
+  // an unpaid or tampered-with session id from ever claiming "payment
+  // received" below — nothing here trusts the URL alone.
+  if (!key) {
+    try {
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      paid = session.payment_status === 'paid';
+      if (paid && !licenses.getLicenseBySession(session.id)) {
+        key = licenses.createLicense({
+          email: session.customer_details?.email || session.customer_email || null,
+          stripeCustomerId: typeof session.customer === 'string' ? session.customer : session.customer?.id || null,
+          stripeSessionId: session.id,
+        });
+      }
+    } catch (err) {
+      console.error('thank-you page session lookup failed', err);
+      return res.status(404).send('<p>We could not find that order. If you believe this is an error, contact support@bluebootapps.com.</p>');
+    }
+  }
+
+  if (!paid) {
+    return res.status(200).send('<p>This order has not been completed. If you were charged and see this message, contact support@bluebootapps.com.</p>');
+  }
+
+  if (!key) {
+    return res.status(200).send('<p>Payment received — your license key is on its way. If it does not arrive shortly, contact support@bluebootapps.com.</p>');
+  }
+
+  return res.status(200).send(
+    `<p>Thanks for your purchase. Your license key:</p><p style="font-size:20px;font-weight:700;">${key}</p><p>Paste this into Service Booking AI's Settings page on your WordPress site.</p>`
+  );
+});
+
+app.post('/license/activate', (req, res) => {
+  const { license_key, site_url } = req.body || {};
+  if (!license_key || !site_url) {
+    return res.status(400).json({ allowed: false, reason: 'bad_request' });
+  }
+  return res.status(200).json(licenses.activateSite(license_key, site_url));
+});
+
+app.post('/license/validate', (req, res) => {
+  const { license_key, site_url } = req.body || {};
+  if (!license_key || !site_url) {
+    return res.status(400).json({ valid: false, reason: 'bad_request' });
+  }
+  return res.status(200).json(licenses.validateSite(license_key, site_url));
+});
+
+app.post('/license/deactivate', (req, res) => {
+  const { license_key, site_url } = req.body || {};
+  if (!license_key || !site_url) {
+    return res.status(400).json({ ok: false, reason: 'bad_request' });
+  }
+  return res.status(200).json(licenses.deactivateSite(license_key, site_url));
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));

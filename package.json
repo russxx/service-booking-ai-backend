@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "openai": "^4.68.0",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "stripe": "^17.3.1"
   }
 }
