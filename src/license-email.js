@@ -39,6 +39,10 @@ async function sendLicenseEmailOnce({ licenseKey, email }) {
     secure: port === 465,
     requireTLS: port !== 465,
     auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
+    // Some container networks resolve the mail host to an IPv6 address with
+    // no outbound IPv6 route, which hangs until connectionTimeout instead of
+    // falling back to IPv4 — force IPv4 so that dead-end never gets tried.
+    family: 4,
     connectionTimeout: 8000,
     greetingTimeout: 8000,
     socketTimeout: 15000,
