@@ -1,5 +1,6 @@
 const express = require('express');
 const OpenAI = require('openai');
+const usageTracker = require('./usage');
 
 const app = express();
 app.use(express.json({ limit: '300kb' }));
@@ -128,6 +129,10 @@ app.post('/chat', async (req, res) => {
       ],
     });
 
+    if (completion.usage) {
+      usageTracker.logUsage(MODEL, completion.usage.prompt_tokens || 0, completion.usage.completion_tokens || 0);
+    }
+
     const raw = completion.choices?.[0]?.message?.content || '';
     let parsed;
     try {
@@ -247,6 +252,10 @@ app.post('/extract-business-info', async (req, res) => {
       messages: [{ role: 'user', content: prompt }],
     });
 
+    if (completion.usage) {
+      usageTracker.logUsage(MODEL, completion.usage.prompt_tokens || 0, completion.usage.completion_tokens || 0);
+    }
+
     const raw = completion.choices?.[0]?.message?.content || '{}';
     let parsed;
     try {
@@ -265,6 +274,23 @@ app.post('/extract-business-info', async (req, res) => {
     console.error('extract error', err);
     return res.status(500).json({ error: 'Scan failed, please try again.' });
   }
+});
+
+app.get('/usage', (req, res) => {
+  const { site_key } = req.query || {};
+  if (!site_key) {
+    return res.status(400).json({ error: 'Bad request.' });
+  }
+  return res.status(200).json(usageTracker.getSummary());
+});
+
+app.post('/usage/reset', (req, res) => {
+  const { site_key } = req.body || {};
+  if (!site_key) {
+    return res.status(400).json({ error: 'Bad request.' });
+  }
+  usageTracker.reset();
+  return res.status(200).json({ ok: true });
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
