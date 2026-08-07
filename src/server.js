@@ -4,6 +4,7 @@ const Stripe = require('stripe');
 const usageTracker = require('./usage');
 const licenses = require('./licenses');
 const updates = require('./updates');
+const licenseEmail = require('./license-email');
 
 const app = express();
 
@@ -38,12 +39,14 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
         // Magpie's webhook has to guard against, so a simple "does a
         // license for this session already exist" check is enough here.
         if (!licenses.getLicenseBySession(session.id)) {
+          const email = session.customer_details?.email || session.customer_email || null;
           const key = licenses.createLicense({
-            email: session.customer_details?.email || session.customer_email || null,
+            email,
             stripeCustomerId: typeof session.customer === 'string' ? session.customer : session.customer?.id || null,
             stripeSessionId: session.id,
           });
           console.log('license created', key, 'for session', session.id);
+          await licenseEmail.sendLicenseEmailOnce({ licenseKey: key, email });
         }
       } else if (event.type === 'charge.refunded' || event.type === 'charge.dispute.created') {
         // A refund/dispute arrives keyed by charge, not checkout session, so
@@ -429,11 +432,13 @@ app.get('/license/thank-you', async (req, res) => {
       const session = await stripe.checkout.sessions.retrieve(sessionId);
       paid = session.payment_status === 'paid';
       if (paid && !licenses.getLicenseBySession(session.id)) {
+        const email = session.customer_details?.email || session.customer_email || null;
         key = licenses.createLicense({
-          email: session.customer_details?.email || session.customer_email || null,
+          email,
           stripeCustomerId: typeof session.customer === 'string' ? session.customer : session.customer?.id || null,
           stripeSessionId: session.id,
         });
+        await licenseEmail.sendLicenseEmailOnce({ licenseKey: key, email });
       }
     } catch (err) {
       console.error('thank-you page session lookup failed', err);
@@ -449,9 +454,38 @@ app.get('/license/thank-you', async (req, res) => {
     return res.status(200).send('<p>Payment received — your license key is on its way. If it does not arrive shortly, contact support@bluebootapps.com.</p>');
   }
 
+  const downloadUrl = `${process.env.APP_URL}/license/download?license_key=${encodeURIComponent(key)}`;
   return res.status(200).send(
-    `<p>Thanks for your purchase. Your license key:</p><p style="font-size:20px;font-weight:700;">${key}</p><p>Paste this into Service Booking AI's Settings page on your WordPress site.</p>`
+    `<p>Thanks for your purchase. Your license key:</p>` +
+    `<p style="font-size:20px;font-weight:700;">${key}</p>` +
+    `<p><a href="${downloadUrl}">Download Service Booking AI</a></p>` +
+    `<p>Install it (Plugins → Add New → Upload Plugin), then paste this key into Service Booking AI's Settings page — it activates automatically when you save.</p>` +
+    `<p>We've also emailed this to you in case you need it again.</p>`
   );
+});
+
+// The one download endpoint that doesn't require an activated site — there's
+// nothing to activate yet the first time a buyer needs the zip at all.
+// Gated only by the license actually being active (not revoked), so a
+// refunded purchase can't keep re-downloading either.
+app.get('/license/download', (req, res) => {
+  const { license_key } = req.query || {};
+  if (!license_key) {
+    return res.status(400).send('Missing license key.');
+  }
+
+  const license = licenses.getLicense(license_key);
+  if (!license || license.status !== 'active') {
+    return res.status(403).send('This license is not valid. Contact support@bluebootapps.com if you believe this is an error.');
+  }
+
+  const latest = updates.getLatest();
+  const zipPath = latest ? updates.getZipPath(latest.version) : null;
+  if (!zipPath) {
+    return res.status(404).send('No release available yet — contact support@bluebootapps.com.');
+  }
+
+  return res.download(zipPath, `service-booking-ai-standalone-${latest.version}.zip`);
 });
 
 app.post('/license/activate', (req, res) => {

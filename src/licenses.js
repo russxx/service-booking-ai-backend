@@ -129,6 +129,43 @@ function deactivateSite(key, siteUrlInput) {
   return { ok: true };
 }
 
+/**
+ * Delivery tracking for the license email — a Stripe webhook retry must
+ * not send a second email for the same purchase. Mirrors the claim/
+ * complete/release pattern Magpie's backend uses for the same reason
+ * (checkout.session.completed can be delivered more than once), just
+ * against the file store instead of Postgres.
+ */
+function claimEmailDelivery(key) {
+	const state = load();
+	const license = state.licenses[key];
+	if (!license) return false;
+	if (license.emailSentAt) return false;
+	if (license.emailClaimedAt && Date.now() - new Date(license.emailClaimedAt).getTime() < 10 * 60 * 1000) {
+		return false; // another delivery attempt is still in flight
+	}
+	license.emailClaimedAt = new Date().toISOString();
+	save(state);
+	return true;
+}
+
+function completeEmailDelivery(key) {
+	const state = load();
+	const license = state.licenses[key];
+	if (!license) return;
+	license.emailClaimedAt = null;
+	license.emailSentAt = new Date().toISOString();
+	save(state);
+}
+
+function releaseEmailDelivery(key) {
+	const state = load();
+	const license = state.licenses[key];
+	if (!license || license.emailSentAt) return;
+	license.emailClaimedAt = null;
+	save(state);
+}
+
 // For refunds/chargebacks, via the Stripe webhook.
 function revokeLicense(key) {
   const state = load();
@@ -149,5 +186,8 @@ module.exports = {
   validateSite,
   deactivateSite,
   revokeLicense,
+  claimEmailDelivery,
+  completeEmailDelivery,
+  releaseEmailDelivery,
   SITE_LIMIT,
 };
