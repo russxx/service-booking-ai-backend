@@ -8,9 +8,10 @@
     "start": "node src/server.js"
   },
   "dependencies": {
-    "openai": "^4.68.0",
     "express": "^4.19.2",
-    "stripe": "^17.3.1",
-    "nodemailer": "^6.9.15"
+    "nodemailer": "^6.9.15",
+    "openai": "^4.68.0",
+    "pg": "^8.22.0",
+    "stripe": "^17.3.1"
   }
 }

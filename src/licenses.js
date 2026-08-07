@@ -1,36 +1,8 @@
-const fs = require('fs');
-const path = require('path');
 const crypto = require('crypto');
-
-// Same bind-mount pattern as usage.js — persists across redeploys via the
-// volume mounted at /app/data. This is a single traditional Node process
-// (not serverless/multi-instance), so plain synchronous file I/O makes the
-// check-then-write in activateSite() atomic within one event-loop tick —
-// no cross-request race, no need for the Postgres advisory-lock dance
-// Magpie's backend uses for the same problem in a multi-instance setting.
-const DATA_DIR = process.env.SBA_USAGE_DATA_DIR || path.join(__dirname, '..', 'data');
-const DATA_FILE = path.join(DATA_DIR, 'licenses.json');
+const { getPool } = require('./db');
 
 // How many WordPress sites a single purchase can be active on at once.
 const SITE_LIMIT = 1;
-
-function load() {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    return { licenses: parsed.licenses || {} };
-  } catch (e) {
-    return { licenses: {} };
-  }
-}
-
-function save(state) {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(DATA_FILE, JSON.stringify(state), 'utf8');
-  } catch (e) {
-    console.error('licenses: failed to persist license data:', e.message);
-  }
-}
 
 function newLicenseKey() {
   return `SBA-${crypto.randomUUID().toUpperCase()}`;
@@ -43,137 +15,166 @@ function normalizeSiteUrl(input) {
   return trimmed;
 }
 
-// Called from the Stripe webhook once a checkout actually completes.
-function createLicense({ email, stripeCustomerId, stripeSessionId }) {
-  const state = load();
-  const key = newLicenseKey();
-  state.licenses[key] = {
-    email: email || null,
-    stripeCustomerId: stripeCustomerId || null,
-    stripeSessionId: stripeSessionId || null,
-    status: 'active',
-    createdAt: new Date().toISOString(),
-    sites: [],
+function rowToLicense(row) {
+  if (!row) return null;
+  return {
+    licenseKey: row.license_key,
+    email: row.email,
+    stripeCustomerId: row.stripe_customer_id,
+    stripeSessionId: row.stripe_session_id,
+    status: row.status,
+    createdAt: row.created_at,
+    emailClaimedAt: row.email_claimed_at,
+    emailSentAt: row.email_sent_at,
   };
-  save(state);
+}
+
+// Called from the Stripe webhook once a checkout actually completes.
+async function createLicense({ email, stripeCustomerId, stripeSessionId }) {
+  const key = newLicenseKey();
+  await getPool().query(
+    `insert into licenses (license_key, email, stripe_customer_id, stripe_session_id)
+     values ($1, $2, $3, $4)`,
+    [key, email || null, stripeCustomerId || null, stripeSessionId || null]
+  );
   return key;
 }
 
-function getLicense(key) {
-  const state = load();
-  return state.licenses[key] || null;
+async function getLicense(key) {
+  const { rows } = await getPool().query('select * from licenses where license_key = $1', [key]);
+  return rowToLicense(rows[0]);
 }
 
-function getLicenseBySession(stripeSessionId) {
-  const state = load();
-  return Object.values(state.licenses).find((lic) => lic.stripeSessionId === stripeSessionId) || null;
+async function getLicenseBySession(stripeSessionId) {
+  const { rows } = await getPool().query('select * from licenses where stripe_session_id = $1', [stripeSessionId]);
+  return rowToLicense(rows[0]);
 }
 
-function getLicenseKeyBySession(stripeSessionId) {
-  const state = load();
-  const entry = Object.entries(state.licenses).find(([, lic]) => lic.stripeSessionId === stripeSessionId);
-  return entry ? entry[0] : null;
+async function getLicenseKeyBySession(stripeSessionId) {
+  const license = await getLicenseBySession(stripeSessionId);
+  return license ? license.licenseKey : null;
 }
 
 /**
  * Registers a site against a license, or just refreshes it if already
  * registered — re-activating the same site (e.g. re-saving the settings
  * field) must never count a second time against the limit.
+ *
+ * The count-then-insert is wrapped in a transaction with an advisory lock
+ * per license key (same technique Magpie's devices.ts uses) so two
+ * activation attempts landing at the same instant can't both slip past the
+ * limit check before either has inserted its row.
  */
-function activateSite(key, siteUrlInput) {
+async function activateSite(key, siteUrlInput) {
   const siteUrl = normalizeSiteUrl(siteUrlInput);
-  const state = load();
-  const license = state.licenses[key];
-
-  if (!license) return { allowed: false, reason: 'not_found' };
-  if (license.status !== 'active') return { allowed: false, reason: 'revoked' };
   if (!siteUrl) return { allowed: false, reason: 'invalid_site' };
 
-  const now = new Date().toISOString();
-  const existing = license.sites.find((s) => s.url === siteUrl);
-  if (existing) {
-    existing.lastSeen = now;
-    save(state);
+  const license = await getLicense(key);
+  if (!license) return { allowed: false, reason: 'not_found' };
+  if (license.status !== 'active') return { allowed: false, reason: 'revoked' };
+
+  const client = await getPool().connect();
+  try {
+    await client.query('begin');
+    await client.query('select pg_advisory_xact_lock(hashtext($1))', [key]);
+
+    const existing = await client.query(
+      'select 1 from license_sites where license_key = $1 and site_url = $2',
+      [key, siteUrl]
+    );
+    if (existing.rowCount > 0) {
+      await client.query(
+        'update license_sites set last_seen = now() where license_key = $1 and site_url = $2',
+        [key, siteUrl]
+      );
+      await client.query('commit');
+      return { allowed: true };
+    }
+
+    const { rows } = await client.query(
+      'select count(*)::int as n from license_sites where license_key = $1',
+      [key]
+    );
+    if (rows[0].n >= SITE_LIMIT) {
+      await client.query('commit');
+      return { allowed: false, reason: 'site_limit', limit: SITE_LIMIT };
+    }
+
+    await client.query(
+      'insert into license_sites (license_key, site_url) values ($1, $2)',
+      [key, siteUrl]
+    );
+    await client.query('commit');
     return { allowed: true };
+  } catch (err) {
+    await client.query('rollback').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
-
-  if (license.sites.length >= SITE_LIMIT) {
-    return { allowed: false, reason: 'site_limit', limit: SITE_LIMIT };
-  }
-
-  license.sites.push({ url: siteUrl, firstSeen: now, lastSeen: now });
-  save(state);
-  return { allowed: true };
 }
 
-function validateSite(key, siteUrlInput) {
+async function validateSite(key, siteUrlInput) {
   const siteUrl = normalizeSiteUrl(siteUrlInput);
-  const license = getLicense(key);
+  const license = await getLicense(key);
   if (!license) return { valid: false, reason: 'not_found' };
   if (license.status !== 'active') return { valid: false, reason: 'revoked' };
-  if (!siteUrl || !license.sites.some((s) => s.url === siteUrl)) {
-    return { valid: false, reason: 'site_not_activated' };
-  }
-  return { valid: true };
+  if (!siteUrl) return { valid: false, reason: 'site_not_activated' };
+
+  const { rowCount } = await getPool().query(
+    'select 1 from license_sites where license_key = $1 and site_url = $2',
+    [key, siteUrl]
+  );
+  return rowCount > 0 ? { valid: true } : { valid: false, reason: 'site_not_activated' };
 }
 
 // Frees this license's one slot — lets a genuine customer move the plugin
 // to a different site.
-function deactivateSite(key, siteUrlInput) {
+async function deactivateSite(key, siteUrlInput) {
   const siteUrl = normalizeSiteUrl(siteUrlInput);
-  const state = load();
-  const license = state.licenses[key];
+  const license = await getLicense(key);
   if (!license) return { ok: false, reason: 'not_found' };
-  license.sites = license.sites.filter((s) => s.url !== siteUrl);
-  save(state);
+  await getPool().query('delete from license_sites where license_key = $1 and site_url = $2', [key, siteUrl]);
   return { ok: true };
+}
+
+// For refunds/chargebacks, via the Stripe webhook.
+async function revokeLicense(key) {
+  const { rowCount } = await getPool().query("update licenses set status = 'revoked' where license_key = $1", [key]);
+  return rowCount > 0;
 }
 
 /**
  * Delivery tracking for the license email — a Stripe webhook retry must
  * not send a second email for the same purchase. Mirrors the claim/
  * complete/release pattern Magpie's backend uses for the same reason
- * (checkout.session.completed can be delivered more than once), just
- * against the file store instead of Postgres.
+ * (checkout.session.completed can be delivered more than once).
  */
-function claimEmailDelivery(key) {
-	const state = load();
-	const license = state.licenses[key];
-	if (!license) return false;
-	if (license.emailSentAt) return false;
-	if (license.emailClaimedAt && Date.now() - new Date(license.emailClaimedAt).getTime() < 10 * 60 * 1000) {
-		return false; // another delivery attempt is still in flight
-	}
-	license.emailClaimedAt = new Date().toISOString();
-	save(state);
-	return true;
+async function claimEmailDelivery(key) {
+  const { rows } = await getPool().query(
+    `update licenses
+     set email_claimed_at = now()
+     where license_key = $1
+       and email_sent_at is null
+       and (email_claimed_at is null or email_claimed_at < now() - interval '10 minutes')
+     returning license_key`,
+    [key]
+  );
+  return rows.length > 0;
 }
 
-function completeEmailDelivery(key) {
-	const state = load();
-	const license = state.licenses[key];
-	if (!license) return;
-	license.emailClaimedAt = null;
-	license.emailSentAt = new Date().toISOString();
-	save(state);
+async function completeEmailDelivery(key) {
+  await getPool().query(
+    'update licenses set email_claimed_at = null, email_sent_at = now() where license_key = $1',
+    [key]
+  );
 }
 
-function releaseEmailDelivery(key) {
-	const state = load();
-	const license = state.licenses[key];
-	if (!license || license.emailSentAt) return;
-	license.emailClaimedAt = null;
-	save(state);
-}
-
-// For refunds/chargebacks, via the Stripe webhook.
-function revokeLicense(key) {
-  const state = load();
-  const license = state.licenses[key];
-  if (!license) return false;
-  license.status = 'revoked';
-  save(state);
-  return true;
+async function releaseEmailDelivery(key) {
+  await getPool().query(
+    "update licenses set email_claimed_at = null where license_key = $1 and email_sent_at is null",
+    [key]
+  );
 }
 
 module.exports = {

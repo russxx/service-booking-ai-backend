@@ -1,6 +1,7 @@
 const express = require('express');
 const OpenAI = require('openai');
 const Stripe = require('stripe');
+const db = require('./db');
 const usageTracker = require('./usage');
 const licenses = require('./licenses');
 const updates = require('./updates');
@@ -38,9 +39,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
         // naturally idempotent grant, unlike the additive credit top-ups
         // Magpie's webhook has to guard against, so a simple "does a
         // license for this session already exist" check is enough here.
-        if (!licenses.getLicenseBySession(session.id)) {
+        if (!(await licenses.getLicenseBySession(session.id))) {
           const email = session.customer_details?.email || session.customer_email || null;
-          const key = licenses.createLicense({
+          const key = await licenses.createLicense({
             email,
             stripeCustomerId: typeof session.customer === 'string' ? session.customer : session.customer?.id || null,
             stripeSessionId: session.id,
@@ -57,9 +58,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), (req, res) => {
         if (paymentIntentId) {
           const sessions = await stripe.checkout.sessions.list({ payment_intent: paymentIntentId, limit: 1 });
           const session = sessions.data[0];
-          const key = session ? licenses.getLicenseKeyBySession(session.id) : null;
+          const key = session ? await licenses.getLicenseKeyBySession(session.id) : null;
           if (key) {
-            licenses.revokeLicense(key);
+            await licenses.revokeLicense(key);
             console.log('license revoked', key, 'due to', event.type);
           }
         }
@@ -199,7 +200,7 @@ app.post('/chat', async (req, res) => {
     });
 
     if (completion.usage) {
-      usageTracker.logUsage(MODEL, completion.usage.prompt_tokens || 0, completion.usage.completion_tokens || 0);
+      await usageTracker.logUsage(MODEL, completion.usage.prompt_tokens || 0, completion.usage.completion_tokens || 0);
     }
 
     const raw = completion.choices?.[0]?.message?.content || '';
@@ -216,8 +217,7 @@ app.post('/chat', async (req, res) => {
     const matchedSvc = matched ? allServices.find((s) => s.name === matched) : null;
 
     // Never trust the model's duration figure blindly — clamp it to the
-    // matched service's own configured range, same as every other number
-    // in this response.
+    // matched service's own configured range.
     let estimatedDuration = null;
     if (matchedSvc) {
       const dMin = matchedSvc.duration_min || 60;
@@ -322,7 +322,7 @@ app.post('/extract-business-info', async (req, res) => {
     });
 
     if (completion.usage) {
-      usageTracker.logUsage(MODEL, completion.usage.prompt_tokens || 0, completion.usage.completion_tokens || 0);
+      await usageTracker.logUsage(MODEL, completion.usage.prompt_tokens || 0, completion.usage.completion_tokens || 0);
     }
 
     const raw = completion.choices?.[0]?.message?.content || '{}';
@@ -345,20 +345,20 @@ app.post('/extract-business-info', async (req, res) => {
   }
 });
 
-app.get('/usage', (req, res) => {
+app.get('/usage', async (req, res) => {
   const { site_key } = req.query || {};
   if (!site_key) {
     return res.status(400).json({ error: 'Bad request.' });
   }
-  return res.status(200).json(usageTracker.getSummary());
+  return res.status(200).json(await usageTracker.getSummary());
 });
 
-app.post('/usage/reset', (req, res) => {
+app.post('/usage/reset', async (req, res) => {
   const { site_key } = req.body || {};
   if (!site_key) {
     return res.status(400).json({ error: 'Bad request.' });
   }
-  usageTracker.reset();
+  await usageTracker.reset();
   return res.status(200).json({ ok: true });
 });
 
@@ -419,7 +419,7 @@ app.get('/license/thank-you', async (req, res) => {
     return res.status(400).send('<p>Missing session.</p>');
   }
 
-  let key = licenses.getLicenseKeyBySession(sessionId);
+  let key = await licenses.getLicenseKeyBySession(sessionId);
   let paid = !!key;
 
   // The webhook usually wins the race, but if this page loads first, confirm
@@ -431,9 +431,9 @@ app.get('/license/thank-you', async (req, res) => {
     try {
       const session = await stripe.checkout.sessions.retrieve(sessionId);
       paid = session.payment_status === 'paid';
-      if (paid && !licenses.getLicenseBySession(session.id)) {
+      if (paid && !(await licenses.getLicenseBySession(session.id))) {
         const email = session.customer_details?.email || session.customer_email || null;
-        key = licenses.createLicense({
+        key = await licenses.createLicense({
           email,
           stripeCustomerId: typeof session.customer === 'string' ? session.customer : session.customer?.id || null,
           stripeSessionId: session.id,
@@ -468,54 +468,56 @@ app.get('/license/thank-you', async (req, res) => {
 // nothing to activate yet the first time a buyer needs the zip at all.
 // Gated only by the license actually being active (not revoked), so a
 // refunded purchase can't keep re-downloading either.
-app.get('/license/download', (req, res) => {
+app.get('/license/download', async (req, res) => {
   const { license_key } = req.query || {};
   if (!license_key) {
     return res.status(400).send('Missing license key.');
   }
 
-  const license = licenses.getLicense(license_key);
+  const license = await licenses.getLicense(license_key);
   if (!license || license.status !== 'active') {
     return res.status(403).send('This license is not valid. Contact support@bluebootapps.com if you believe this is an error.');
   }
 
-  const latest = updates.getLatest();
-  const zipPath = latest ? updates.getZipPath(latest.version) : null;
-  if (!zipPath) {
+  const latest = await updates.getLatest();
+  const zipBuffer = latest ? await updates.getZipBuffer(latest.version) : null;
+  if (!zipBuffer) {
     return res.status(404).send('No release available yet — contact support@bluebootapps.com.');
   }
 
-  return res.download(zipPath, `service-booking-ai-standalone-${latest.version}.zip`);
+  res.set('Content-Disposition', `attachment; filename="service-booking-ai-standalone-${latest.version}.zip"`);
+  res.set('Content-Type', 'application/zip');
+  return res.send(zipBuffer);
 });
 
-app.post('/license/activate', (req, res) => {
+app.post('/license/activate', async (req, res) => {
   const { license_key, site_url } = req.body || {};
   if (!license_key || !site_url) {
     return res.status(400).json({ allowed: false, reason: 'bad_request' });
   }
-  return res.status(200).json(licenses.activateSite(license_key, site_url));
+  return res.status(200).json(await licenses.activateSite(license_key, site_url));
 });
 
-app.post('/license/validate', (req, res) => {
+app.post('/license/validate', async (req, res) => {
   const { license_key, site_url } = req.body || {};
   if (!license_key || !site_url) {
     return res.status(400).json({ valid: false, reason: 'bad_request' });
   }
-  return res.status(200).json(licenses.validateSite(license_key, site_url));
+  return res.status(200).json(await licenses.validateSite(license_key, site_url));
 });
 
-app.post('/license/deactivate', (req, res) => {
+app.post('/license/deactivate', async (req, res) => {
   const { license_key, site_url } = req.body || {};
   if (!license_key || !site_url) {
     return res.status(400).json({ ok: false, reason: 'bad_request' });
   }
-  return res.status(200).json(licenses.deactivateSite(license_key, site_url));
+  return res.status(200).json(await licenses.deactivateSite(license_key, site_url));
 });
 
 // Publishing a new version: raw zip bytes in the body, version/changelog in
 // headers rather than multipart form fields — avoids pulling in a multipart
 // parser dependency for what's a one-person, occasional operation.
-app.post('/admin/publish-update', express.raw({ type: 'application/zip', limit: '20mb' }), (req, res) => {
+app.post('/admin/publish-update', express.raw({ type: 'application/zip', limit: '20mb' }), async (req, res) => {
   const secret = process.env.UPDATE_ADMIN_SECRET;
   if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
     return res.status(401).json({ error: 'unauthorized' });
@@ -533,24 +535,24 @@ app.post('/admin/publish-update', express.raw({ type: 'application/zip', limit: 
     // Malformed changelog header — publish still proceeds with an empty changelog rather than failing the whole release over cosmetic text.
   }
 
-  updates.publish({ version, changelog, zipBuffer: req.body });
+  await updates.publish({ version, changelog, zipBuffer: req.body });
   return res.status(200).json({ ok: true, version });
 });
 
 // Requires a valid, activated license for this site — updates are part of
 // what an active license pays for, same as the AI chat itself.
-app.get('/updates/check', (req, res) => {
+app.get('/updates/check', async (req, res) => {
   const { license_key, site_url, current_version } = req.query || {};
   if (!license_key || !site_url || !current_version) {
     return res.status(400).json({ error: 'bad_request' });
   }
 
-  const check = licenses.validateSite(license_key, site_url);
+  const check = await licenses.validateSite(license_key, site_url);
   if (!check.valid) {
     return res.status(200).json({ update_available: false, reason: check.reason });
   }
 
-  const latest = updates.getLatest();
+  const latest = await updates.getLatest();
   if (!latest || !updates.isNewer(latest.version, current_version)) {
     return res.status(200).json({ update_available: false });
   }
@@ -567,27 +569,41 @@ app.get('/updates/check', (req, res) => {
 // (no custom headers it would send along), so the license/site check has to
 // happen via query params baked into the download_url above rather than an
 // Authorization header.
-app.get('/updates/download', (req, res) => {
+app.get('/updates/download', async (req, res) => {
   const { license_key, site_url } = req.query || {};
   if (!license_key || !site_url) {
     return res.status(400).send('Bad request.');
   }
 
-  const check = licenses.validateSite(license_key, site_url);
+  const check = await licenses.validateSite(license_key, site_url);
   if (!check.valid) {
     return res.status(403).send('License not valid for this site.');
   }
 
-  const latest = updates.getLatest();
-  const zipPath = latest ? updates.getZipPath(latest.version) : null;
-  if (!zipPath) {
+  const latest = await updates.getLatest();
+  const zipBuffer = latest ? await updates.getZipBuffer(latest.version) : null;
+  if (!zipBuffer) {
     return res.status(404).send('No update available.');
   }
 
-  return res.download(zipPath, `service-booking-ai-standalone-${latest.version}.zip`);
+  res.set('Content-Disposition', `attachment; filename="service-booking-ai-standalone-${latest.version}.zip"`);
+  res.set('Content-Type', 'application/zip');
+  return res.send(zipBuffer);
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`service-booking-ai-backend listening on ${port}`));
+
+// Table creation happens once at startup rather than lazily on first
+// request — a request arriving before the schema exists would otherwise
+// hit a confusing "relation does not exist" error instead of a clean
+// startup failure.
+db.ensureSchema()
+  .then(() => {
+    app.listen(port, () => console.log(`service-booking-ai-backend listening on ${port}`));
+  })
+  .catch((err) => {
+    console.error('Failed to initialize database schema:', err);
+    process.exit(1);
+  });
