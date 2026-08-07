@@ -3,6 +3,7 @@ const OpenAI = require('openai');
 const Stripe = require('stripe');
 const usageTracker = require('./usage');
 const licenses = require('./licenses');
+const updates = require('./updates');
 
 const app = express();
 
@@ -475,6 +476,81 @@ app.post('/license/deactivate', (req, res) => {
     return res.status(400).json({ ok: false, reason: 'bad_request' });
   }
   return res.status(200).json(licenses.deactivateSite(license_key, site_url));
+});
+
+// Publishing a new version: raw zip bytes in the body, version/changelog in
+// headers rather than multipart form fields — avoids pulling in a multipart
+// parser dependency for what's a one-person, occasional operation.
+app.post('/admin/publish-update', express.raw({ type: 'application/zip', limit: '20mb' }), (req, res) => {
+  const secret = process.env.UPDATE_ADMIN_SECRET;
+  if (!secret || req.headers.authorization !== `Bearer ${secret}`) {
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+
+  const version = req.headers['x-version'];
+  if (!version || !Buffer.isBuffer(req.body) || !req.body.length) {
+    return res.status(400).json({ error: 'bad_request' });
+  }
+
+  let changelog = '';
+  try {
+    changelog = Buffer.from(req.headers['x-changelog-base64'] || '', 'base64').toString('utf8');
+  } catch (e) {
+    // Malformed changelog header — publish still proceeds with an empty changelog rather than failing the whole release over cosmetic text.
+  }
+
+  updates.publish({ version, changelog, zipBuffer: req.body });
+  return res.status(200).json({ ok: true, version });
+});
+
+// Requires a valid, activated license for this site — updates are part of
+// what an active license pays for, same as the AI chat itself.
+app.get('/updates/check', (req, res) => {
+  const { license_key, site_url, current_version } = req.query || {};
+  if (!license_key || !site_url || !current_version) {
+    return res.status(400).json({ error: 'bad_request' });
+  }
+
+  const check = licenses.validateSite(license_key, site_url);
+  if (!check.valid) {
+    return res.status(200).json({ update_available: false, reason: check.reason });
+  }
+
+  const latest = updates.getLatest();
+  if (!latest || !updates.isNewer(latest.version, current_version)) {
+    return res.status(200).json({ update_available: false });
+  }
+
+  return res.status(200).json({
+    update_available: true,
+    version: latest.version,
+    changelog: latest.changelog,
+    download_url: `${process.env.APP_URL}/updates/download?license_key=${encodeURIComponent(license_key)}&site_url=${encodeURIComponent(site_url)}`,
+  });
+});
+
+// WordPress's core upgrader downloads this URL directly with a plain GET
+// (no custom headers it would send along), so the license/site check has to
+// happen via query params baked into the download_url above rather than an
+// Authorization header.
+app.get('/updates/download', (req, res) => {
+  const { license_key, site_url } = req.query || {};
+  if (!license_key || !site_url) {
+    return res.status(400).send('Bad request.');
+  }
+
+  const check = licenses.validateSite(license_key, site_url);
+  if (!check.valid) {
+    return res.status(403).send('License not valid for this site.');
+  }
+
+  const latest = updates.getLatest();
+  const zipPath = latest ? updates.getZipPath(latest.version) : null;
+  if (!zipPath) {
+    return res.status(404).send('No update available.');
+  }
+
+  return res.download(zipPath, `service-booking-ai-standalone-${latest.version}.zip`);
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
