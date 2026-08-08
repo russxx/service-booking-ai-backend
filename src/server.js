@@ -345,6 +345,77 @@ app.post('/extract-business-info', async (req, res) => {
   }
 });
 
+function buildGuidelineDraftPrompt(transcript, correction) {
+  const system = [
+    'You are helping a local service business owner refine the rules that control their AI receptionist chatbot.',
+    "You will be given a real customer conversation, and the owner's plain-language explanation of what the AI should have done differently.",
+    "Write exactly ONE new rule to add to the business's 'Rules for the AI' list. Match this house style, taken from the product's own placeholder examples:",
+    '- "We don\'t take on jobs more than 15 miles from base — say so and don\'t offer a booking."',
+    '- "If a job sounds like it\'ll cost more to fix than to replace, mention that plainly and let the customer weigh it up before booking."',
+    '- "For anything that sounds unsafe or you\'re not confident scoping over chat, don\'t give a price or time estimate — say a team member will call them back to discuss it, and escalate."',
+    "Rules are one line, plain English, and instruct the AI what to do in a specific situation — not vague general advice. Generalize just enough from the one conversation to cover the same situation next time, without overreaching into unrelated cases the owner didn't mention.",
+    'Reply with ONLY the rule text itself — no quotation marks, no numbering, no preamble, no explanation.',
+  ].join('\n');
+
+  const user = `Conversation:\n${transcript}\n\nWhat the AI should have done instead: ${correction}`;
+
+  return { system, user };
+}
+
+app.post('/draft-guideline', async (req, res) => {
+  try {
+    const { site_key, turns, correction } = req.body || {};
+
+    if (!site_key || !Array.isArray(turns) || !turns.length || typeof correction !== 'string' || !correction.trim()) {
+      return res.status(400).json({ error: 'bad_request' });
+    }
+    if (!withinLimit(site_key + ':fix')) {
+      return res.status(429).json({ error: 'Too many requests — please wait a bit before trying again.' });
+    }
+
+    const transcript = turns
+      .slice(-12)
+      .flatMap((t) => {
+        const lines = [];
+        if (t && t.message) lines.push(`Customer: ${String(t.message).slice(0, 1000)}`);
+        if (t && t.answer) lines.push(`AI: ${String(t.answer).slice(0, 1000)}`);
+        return lines;
+      })
+      .join('\n');
+
+    if (!transcript) {
+      return res.status(400).json({ error: 'empty_transcript' });
+    }
+
+    const { system, user } = buildGuidelineDraftPrompt(transcript, correction.trim().slice(0, 500));
+
+    const completion = await openai.chat.completions.create({
+      model: MODEL,
+      max_tokens: 150,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+    });
+
+    if (completion.usage) {
+      await usageTracker.logUsage(MODEL, completion.usage.prompt_tokens || 0, completion.usage.completion_tokens || 0);
+    }
+
+    let rule = (completion.choices?.[0]?.message?.content || '').trim();
+    rule = rule.replace(/^["']|["']$/g, '');
+
+    if (!rule) {
+      return res.status(502).json({ error: 'draft_failed' });
+    }
+
+    return res.status(200).json({ rule });
+  } catch (err) {
+    console.error('draft-guideline error', err);
+    return res.status(500).json({ error: 'draft_failed' });
+  }
+});
+
 app.get('/usage', async (req, res) => {
   const { site_key } = req.query || {};
   if (!site_key) {
