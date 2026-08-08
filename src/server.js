@@ -416,6 +416,53 @@ app.post('/draft-guideline', async (req, res) => {
   }
 });
 
+function buildImproveGuidelinesPrompt() {
+  return [
+    'You are helping a local service business owner improve the rules that control their AI receptionist chatbot.',
+    "Below is what they've already written in their own words. Rewrite it to be clearer and better organized — one rule per line, plain English, in the same direct, instructional style throughout.",
+    'Preserve every actual rule and instruction they included — do not drop any of their intent, and do not add new rules they didn\'t imply.',
+    "If a line is vague, sharpen it into something the AI can actually act on, but stay true to what they meant rather than inventing specifics they didn't give you.",
+    'Reply with ONLY the improved rules text, one rule per line — no preamble, no explanation, no numbering, no markdown formatting.',
+  ].join('\n');
+}
+
+app.post('/improve-guidelines', async (req, res) => {
+  try {
+    const { site_key, guidelines } = req.body || {};
+
+    if (!site_key || typeof guidelines !== 'string' || !guidelines.trim()) {
+      return res.status(400).json({ error: 'bad_request' });
+    }
+    if (!withinLimit(site_key + ':improve')) {
+      return res.status(429).json({ error: 'Too many requests — please wait a bit before trying again.' });
+    }
+
+    const completion = await openai.chat.completions.create({
+      model: MODEL,
+      max_tokens: 800,
+      messages: [
+        { role: 'system', content: buildImproveGuidelinesPrompt() },
+        { role: 'user', content: guidelines.trim().slice(0, 4000) },
+      ],
+    });
+
+    if (completion.usage) {
+      await usageTracker.logUsage(MODEL, completion.usage.prompt_tokens || 0, completion.usage.completion_tokens || 0);
+    }
+
+    const improved = (completion.choices?.[0]?.message?.content || '').trim();
+
+    if (!improved) {
+      return res.status(502).json({ error: 'improve_failed' });
+    }
+
+    return res.status(200).json({ guidelines: improved });
+  } catch (err) {
+    console.error('improve-guidelines error', err);
+    return res.status(500).json({ error: 'improve_failed' });
+  }
+});
+
 app.get('/usage', async (req, res) => {
   const { site_key } = req.query || {};
   if (!site_key) {
